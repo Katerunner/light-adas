@@ -1,80 +1,124 @@
+import sys
 import time
-import tkinter as tk
-import cv2
-from PIL import Image, ImageTk
+
+from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
+
+from llmrequest import LLMRequest
+from singlestreamvideo import SingleStreamVideo
+from description import Description
 
 
-class Video:
-    def __init__(self, filepath: str):
-        self.video_source = filepath
-        self.cam, self.height, self.width, self.frame_rate = self.open_reset_video()
+class DescriptionUpdater(QThread):
+    textUpdated = pyqtSignal(str)
 
-    def open_reset_video(self):
-        cam = cv2.VideoCapture(self.video_source)
-        height = cam.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        width = cam.get(cv2.CAP_PROP_FRAME_WIDTH)
-        frame_rate = cam.get(cv2.CAP_PROP_FPS)
-        return cam, height, width, frame_rate
+    def __init__(self, description, parent=None):
+        QThread.__init__(self, parent)
+        self.description = description
+        self.frame = None
+        self.last_request_time = time.time()
 
-    def get_frame(self):
-        ret, frame = self.cam.read()
-        if ret:
-            return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        else:
-            return None
+    def run(self):
+        current_time = time.time()
+        if self.frame is not None and (current_time - self.last_request_time) >= 1:  # 1 second interval
+            self.last_request_time = current_time
+            self.description.update_text(self.frame)
+            self.textUpdated.emit(self.description.show_text())
 
 
-class VideoApp:
-    def __init__(self, window, window_title, video_source):
-        self.delay = None
-        self.photo = None
-        self.window = window
-        self.window.title(window_title)
+class VideoWindow(QMainWindow):
+    def __init__(self, video: SingleStreamVideo, description: Description, stylesheet_path: str = "style.css"):
+        super().__init__()
 
-        self.video = Video(video_source)
+        self.video = video
 
-        self.collection = []
+        self.setWindowTitle("PyQt OpenCV Video Player")
+        self.setGeometry(100, 100, 800, 600)
 
-        self.playing = False  # Flag to control playback
-        self.last_time_stamp = time.time()
+        # Central Widget and Layout
+        self.central_widget = QWidget(self)
+        self.layout = QVBoxLayout(self.central_widget)
 
-        self.canvas = tk.Canvas(window, width=self.video.width, height=self.video.height)
-        self.canvas.pack()
+        self.label = QLabel(self)
+        self.label.resize(800, 600)
+        self.layout.addWidget(self.label)
 
-        self.btn_play = tk.Button(window, text="Play", width=50, command=self.play_video)
-        self.btn_play.pack(anchor=tk.CENTER, expand=True)
+        # Play Button
+        self.btn_play = QPushButton("Play", self)
+        # noinspection PyUnresolvedReferences
+        self.btn_play.clicked.connect(self.play_video)
+        self.layout.addWidget(self.btn_play)
 
-        # Ensure the main event loop is initiated
-        self.window.mainloop()
+        # Pause Button
+        self.btn_pause = QPushButton("Pause", self)
+        # noinspection PyUnresolvedReferences
+        self.btn_pause.clicked.connect(self.pause_video)
+        self.layout.addWidget(self.btn_pause)
+
+        self.setCentralWidget(self.central_widget)
+
+        # Description Label
+        self.description_label = QLabel("Description will appear here", self)
+        self.layout.addWidget(self.description_label)
+
+        # Description Updater Thread
+        self.description_updater = DescriptionUpdater(description)
+        # noinspection PyUnresolvedReferences
+        self.description_updater.textUpdated.connect(self.update_description_label)
+
+        self.timer = QTimer(self)
+        # noinspection PyUnresolvedReferences
+        self.timer.timeout.connect(self.update_frame)
+
+        self.is_paused = False
+
+        # Apply dark theme styles
+        stylesheet = self.load_stylesheet(stylesheet_path)
+        self.setStyleSheet(stylesheet)
+
+    @staticmethod
+    def load_stylesheet(file_path):
+        with open(file_path, "r") as f:
+            return f.read()
 
     def play_video(self):
-        if not self.playing:
-            self.playing = True
-            self.update()  # Start the video update loop
-            self.btn_play.config(text="Pause")
-        else:
-            self.playing = False
-            self.btn_play.config(text="Play")
+        if not self.timer.isActive():
+            self.timer.start(int(self.video.frame_rate))
+        self.is_paused = False
 
-    def update(self):
-        if self.playing:
+    def pause_video(self):
+        if self.timer.isActive():
+            self.timer.stop()
+        self.is_paused = True
+
+    def update_frame(self):
+        if not self.is_paused:
             frame = self.video.get_frame()
+            if frame is not None:
+                height, width, channel = frame.shape
+                step = channel * width
+                q_img = QImage(frame.data, width, height, step, QImage.Format_RGB888)
+                self.label.setPixmap(QPixmap.fromImage(q_img))
 
-            if frame is None:
-                self.playing = False
-                return
+                # Update description
+                self.description_updater.frame = frame
+                if not self.description_updater.isRunning():
+                    self.description_updater.start()
 
-            self.photo = ImageTk.PhotoImage(image=frame)
-            self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
-
-            # Calculate or set a default delay
-            delay_seconds = 1 / self.video.frame_rate - (time.time() - self.last_time_stamp)
-            delay_seconds = delay_seconds if delay_seconds > 0 else 0
-            self.delay = int(delay_seconds * 1000)
-            self.window.after(self.delay, self.update)
-            self.last_time_stamp = time.time()
+    def update_description_label(self, text):
+        self.description_label.setText(text)
 
 
-# Create a window and pass it to the video app
-root = tk.Tk()
-app = VideoApp(root, "Python Video Player", "video.mp4")
+def main():
+    app = QApplication(sys.argv)
+    video = SingleStreamVideo("video.mp4")
+    llm_request = LLMRequest()
+    description = Description(llm_request=llm_request)
+    win = VideoWindow(video, description)
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
